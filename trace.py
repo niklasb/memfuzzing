@@ -7,6 +7,9 @@ Uses winappdbg instead of PyDbg (which doesn't seem to be updated anymore).
 import sys, os
 import winappdbg
 import struct
+import argparse
+import shutil
+from collections import defaultdict
 
 class Tracer:
   def __init__(self, pid, functions, strings, log):
@@ -14,6 +17,7 @@ class Tracer:
     self.pid = pid
     self.strings = strings
     self.log = log
+    self.injection_points = defaultdict(set)
 
   def smart_read_string(self, process, address):
     try:
@@ -23,32 +27,42 @@ class Tracer:
     unicode = all(head[i] == 0 for i in (0, 2, 4)) and all(head[i] != 0 for i in (1, 3, 5))
     return process.peek_string(address, fUnicode=unicode) or None
 
-  def trace_call(self, event, ra, *args):
-    results = []
-    proc = event.get_process()
+  def get_injection_points(self):
+    return self.injection_points
+
+  def detect_injected_args(self, proc, thread, args):
     for i, arg in enumerate(args):
       stack_offset = (i + 1)*4
 
       strdata = self.smart_read_string(proc, arg)
-      if strdata and '\x00A\x00A' in strdata:
-        print "yay."
       arg_packed = struct.pack(">I", arg)
       for s in self.strings:
         if strdata and s in strdata:
-          results.append((stack_offset, 'ptr', arg, s))
+          yield (stack_offset, 1, arg, s)
         if s[:4] in arg_packed or s[:4] in arg_packed[::-1]:
-          results.append((stack_offset, 'dword', arg, None))
+          yield (stack_offset, 0, arg, None)
 
-    if results:
-      function_address = hex(event.get_thread().get_pc())[2:]
-      self.log("function_%s(" % function_address)
-      for offset, control_type, arg, data in results:
-        if control_type == 'dword':
-          self.log('  [ESP+%s] 0x%08x' % (offset, arg))
-        elif control_type == 'ptr':
-          self.log('  [ESP+%s] 0x%08x %s' % (offset, arg, repr(data[:10])))
-      self.log(");")
-      self.log("")
+  def trace_call(self, event, ra, *args):
+    proc, thread = event.get_process(), event.get_thread()
+    injections = list(self.detect_injected_args(proc, thread, args))
+    if not injections:
+      return
+
+    function_address = thread.get_pc()
+
+    # save general injection point
+    for offset, deref, _, _ in injections:
+      self.injection_points[function_address].add((offset, deref))
+
+    # log specific injection
+    self.log("function_%08x(" % function_address)
+    for offset, deref, arg, data in injections:
+      if deref == 0:
+        self.log('  [ESP+%s] 0x%08x'    % (offset, arg))
+      elif deref == 1:
+        self.log('  [ESP+%s] 0x%08x %s' % (offset, arg, repr(data[:10])))
+    self.log(");")
+    self.log("")
 
   def run(self):
     dbg = winappdbg.Debug()
@@ -72,7 +86,7 @@ def select_process_id(pattern=''):
   print "Choice | Process Name (PID)"
 
   for i, (pid, name) in enumerate(processes):
-    print  "[%3d]    %s (%d)" % (i+1, name, pid)
+    print  "[%3d]    %s (%d)" % (i + 1, name, pid)
 
   while 1:
     try:
@@ -89,42 +103,58 @@ def select_process_id(pattern=''):
 
 def parse_ida_functions(lines):
   for line in lines:
-    if not line.startswith("sub_"): continue
-    yield int(line.split()[0].replace("sub_", ""), 16)
+    yield int(line.split()[2], 16)
 
 def main():
-  if len(sys.argv) not in (3, 4):
-    print "Usage: %s functions.txt pattern [pid/part of proc name]" % sys.argv[0]
+  parser = argparse.ArgumentParser(description="Trace functions processing user input")
+  parser.add_argument("functions_file",
+                      help="Functions file in IDA copy&paste format")
+  parser.add_argument("pattern",
+                      help=("An ASCII pattern to look for. "
+                            "First 4 bytes will be traced as DWORD as well"))
+  parser.add_argument("-p", "--process",
+                      help="The target process. Can be a PID or part of a process name", 
+                      default='')
+  parser.add_argument("-l", "--logfile",
+                      help="The log file to write to (default: ./trace_log.log)",
+                      default="trace_log.log")
+  args = parser.parse_args()
+
+  try:
+    with open(args.functions_file, 'rb') as f:
+      functions = list(parse_ida_functions(f))
+  except OSError:
+    print >>sys.stderr, "Error: Can't read functions file."
     return 1
 
   try:
-    with open(sys.argv[1], 'rb') as f:
-      functions = list(parse_ida_functions(f))
-  except OSError:
-    print "[*] Can't read functions file"
-    return 1
+    pid = int(args.process)
+  except:
+    pid = select_process_id(args.process)
 
-  pattern = sys.argv[2]
-
-  if len(sys.argv) >= 4:
-    proc = sys.argv[3]
-    try:
-      pid = int(sys.argv[3])
-    except:
-      pid = select_process_id(proc)
-  else:
-    pid = select_process_id()
+  # rotate log files
+  for i in reversed(range(3)):
+    filename = args.logfile + (".%i" % i if i else "")
+    if os.path.exists(filename):
+      shutil.move(filename, "%s.%i" % (args.logfile, i + 1))
 
   # set up logging
-  logfile = open("tracer_log.txt", "wb")
+  logfile = open(args.logfile, "wb")
   def log(msg):
     print msg
     logfile.write(msg + '\n')
 
   # start the tracing
-  tracer = Tracer(pid, functions, strings=[pattern], log=log)
+  tracer = Tracer(pid, functions, strings=[args.pattern], log=log)
   raw_input("Press Return to start the tracing...")
   tracer.run()
+
+  logfile.write("Injection points:\n%s\n" % ("="*20))
+  injection_points = tracer.get_injection_points()
+  for function_addr in sorted(injection_points):
+    args = injection_points[function_addr]
+    arglist = ",".join("%d:%d" % (offset, deref) for offset, deref in sorted(args))
+    logfile.write("%08x %s\n" % (function_addr, arglist))
 
 if __name__ == "__main__":
   try:
