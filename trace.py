@@ -10,14 +10,16 @@ import struct
 import argparse
 import shutil
 from collections import defaultdict
+from memfuzzing import ui_select_process_id
 
-class Tracer:
+class Tracer(object):
   def __init__(self, pid, functions, strings, log):
     self.functions = functions
     self.pid = pid
     self.strings = strings
     self.log = log
     self.injection_points = defaultdict(set)
+    self.first_noise = True
 
   def smart_read_string(self, process, address):
     try:
@@ -46,6 +48,10 @@ class Tracer:
     proc, thread = event.get_process(), event.get_thread()
     injections = list(self.detect_injected_args(proc, thread, args))
     if not injections:
+      if self.first_noise:
+        self.log(" ... Noise ...")
+        self.log("")
+      self.first_noise = False
       return
 
     function_address = thread.get_pc()
@@ -63,6 +69,7 @@ class Tracer:
         self.log('  [ESP+%s] 0x%08x %s' % (offset, arg, repr(data[:10])))
     self.log(");")
     self.log("")
+    self.first_noise = True
 
   def run(self):
     dbg = winappdbg.Debug()
@@ -74,35 +81,10 @@ class Tracer:
     dbg.loop()
 
 
-def select_process_id(pattern=''):
-  processes = [(p.get_pid(), p.get_filename())
-               for p in winappdbg.System() if p.get_filename() and pattern in p.get_filename()]
-  if len(processes) == 0:
-    raise ValueError, "No such process: %s" % pattern
-  if len(processes) == 1:
-    return processes[0][0]
-
-  print "===== Please pick a process to monitor ====="
-  print "Choice | Process Name (PID)"
-
-  for i, (pid, name) in enumerate(processes):
-    print  "[%3d]    %s (%d)" % (i + 1, name, pid)
-
-  while 1:
-    try:
-      index = int(raw_input("Choose wise: "))
-      if 1 <= index <= len(processes): break
-      break
-    except KeyboardInterrupt:
-      raise
-    except:
-      print "\nIncorrect input."
-      continue
-
-  return processes[index - 1][0]
-
 def parse_ida_functions(lines):
   for line in lines:
+    line = line.strip()
+    if not line: continue
     yield int(line.split()[2], 16)
 
 def main():
@@ -130,7 +112,7 @@ def main():
   try:
     pid = int(args.process)
   except:
-    pid = select_process_id(args.process)
+    pid = ui_select_process_id(args.process)
 
   # rotate log files
   for i in reversed(range(3)):
@@ -145,6 +127,7 @@ def main():
     logfile.write(msg + '\n')
 
   # start the tracing
+  log("Attaching to process with PID %d" % pid)
   tracer = Tracer(pid, functions, strings=[args.pattern], log=log)
   raw_input("Press Return to start the tracing...")
   tracer.run()
